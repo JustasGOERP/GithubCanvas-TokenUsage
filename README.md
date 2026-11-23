@@ -2,6 +2,10 @@
 
 A GitHub Copilot canvas showing local session and sub-session token usage, model costs, account allowance, and a month-end credit forecast.
 
+## Screenshot
+
+![Session Token Usage canvas showing the global summary, usage breakdowns, and top sessions](screenshots/session-token-usage.png)
+
 ## Install
 
 Requires the GitHub Copilot app with canvas extension support and Python 3 available as `python` or `py` on PATH. You need access to this private repository.
