@@ -1,0 +1,262 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Session token usage</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--mut:#656d76;--bd:#d0d7de;--acc:#0969da;--bar:#8ec5ff;--sel:#ddf4ff}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#8d96a0;--bd:#30363d;--acc:#4493f8;--bar:#1f6feb;--sel:#142a45}}
+*{box-sizing:border-box}body{margin:0;font:13px system-ui,sans-serif;background:var(--bg);color:var(--fg);display:flex;height:100vh}
+#left{width:340px;border-right:1px solid var(--bd);display:flex;flex-direction:column}
+#bar{padding:8px;border-bottom:1px solid var(--bd);display:grid;gap:6px}
+input,select,button{font:inherit;padding:4px 6px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);border-radius:6px;width:100%;min-width:0}
+input[type=checkbox]{width:auto;padding:0;margin:0;flex:none}
+button{cursor:pointer}label{color:var(--mut);display:flex;align-items:center;gap:6px}
+#bar>*{min-width:0}select{text-overflow:ellipsis}
+#left{flex:none;min-width:0}body{min-width:0}
+#main{min-width:0}
+#list{overflow:auto;flex:1}
+.item{padding:7px 10px;border-bottom:1px solid var(--bd);cursor:pointer}.item:hover{background:var(--sel)}.item.sel{background:var(--sel);border-left:3px solid var(--acc)}
+.item b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mut{color:var(--mut);font-size:12px}
+#main{flex:1;overflow:auto;padding:14px}
+h2{margin:0 0 4px}.cards{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+.card{border:1px solid var(--bd);border-radius:8px;padding:8px 12px;min-width:120px}.card .v{font-size:20px;font-weight:600}
+table{border-collapse:collapse;width:100%;margin:8px 0 18px}th,td{padding:4px 8px;border-bottom:1px solid var(--bd);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left;white-space:normal;min-width:200px}th{color:var(--mut);font-weight:600}
+.bar{display:block;margin:3px 0 0 auto}
+.bar{display:inline-block;height:8px;background:var(--bar);border-radius:3px;vertical-align:middle;margin-left:6px}
+tr.root td{font-weight:600}.tag{font-size:11px;border:1px solid var(--bd);border-radius:10px;padding:0 6px;color:var(--mut)}
+th[data-dir]:not([data-dir=""])::after{content:" " attr(data-dir)}
+</style></head><body>
+<div id="left">
+ <div id="bar">
+  <select id="folder"></select>
+  <input id="q" placeholder="Search sessions...">
+  <label><input type="checkbox" id="month" checked> Current month only</label>
+  <label><input type="checkbox" id="onlyParents"> Only sessions with sub-sessions</label>
+  <label><input type="checkbox" id="arch"> Include archived</label>
+  <button id="summ">Σ Global summary</button>
+  <button id="reload">Refresh</button>
+ </div>
+ <div id="list"></div>
+</div>
+<div id="main"><div class="mut">Loading...</div></div>
+<script>
+const base=location.pathname;let D=null,sel=null,quota=null,quotaError=null;
+const $=id=>document.getElementById(id);
+const fmt=n=>(n||0).toLocaleString("en-US");
+const short=n=>n>=1e6?(n/1e6).toFixed(2)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":String(n||0);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const zero=()=>({input:0,output:0,cached:0,reasoning:0,cost:0,costCalls:0,missingCost:0});
+const add=(a,b)=>{for(const k of ["input","output","cached","reasoning","cost","costCalls","missingCost"])a[k]+=b[k]||0;return a};
+const dollars=n=>"$"+n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+const costText=x=>x.costCalls?(x.missingCost?"≥ ":"")+dollars(x.cost):"Unavailable";
+const costFromModels=ms=>ms.reduce((a,m)=>{a.cost+=m.nano_aiu/1e11;a.costCalls+=m.cost_calls;a.missingCost+=m.calls-m.cost_calls;return a},zero());
+function quotaSummary(){
+  const q=quota?.providerQuotas?.find(x=>x.provider?.kind==="copilot"&&x.observationKind==="account_snapshot"&&x.quantityKind==="authoritative_budget"&&x.acquisitionStatus==="succeeded"&&x.unit==="ai_credits"&&x.quotaId==="premium_interactions");
+  const b=q?.budgetMetadata;
+  if(!b||b.unlimited||![b.entitlement,b.consumed].every(Number.isFinite)||b.entitlement<=0)return null;
+  return {used:b.consumed*0.01,limit:b.entitlement*0.01,remaining:Math.max(0,(b.entitlement-b.consumed)*0.01),creditsUsed:b.consumed,creditsLimit:b.entitlement,reset:b.resetAtEpochMs,observed:q.observedAt};
+}
+function forecast(q,now=Date.now()){
+  if(!q||!Number.isFinite(q.reset))return null;
+  const end=new Date(q.reset);
+  if(end.getUTCDate()!==1||end.getUTCHours()!==0||end.getUTCMinutes()!==0||end.getUTCSeconds()!==0)return null;
+  const start=Date.UTC(end.getUTCFullYear(),end.getUTCMonth()-1,1);
+  if(now<=start||now>=q.reset)return null;
+  const projected=q.used*(q.reset-start)/(now-start);
+  return {projected,additional:Math.max(0,projected-q.used),difference:projected-q.limit,daysLeft:(q.reset-now)/86400000};
+}
+let byId,kids;
+function index(){
+  const ym=new Date().toISOString().slice(0,7),on=$("month").checked;
+  for(const s of D.sessions){
+    if(!s.raw)s.raw={input:s.input,output:s.output,cached:s.cached,reasoning:s.reasoning};
+    const ms=s.models.filter(m=>!on||m.ym===ym);
+    Object.assign(s,costFromModels(ms));
+    Object.assign(s,on?(s.months[ym]||{input:0,output:0,cached:0,reasoning:0}):s.raw);
+    if(s.input>ms.reduce((n,m)=>n+m.input,0)||s.output>ms.reduce((n,m)=>n+m.output,0))s.missingCost++;
+  }
+  byId=new Map(D.sessions.map(s=>[s.id,s]));kids=new Map();
+  for(const s of D.sessions)if(s.parent){(kids.get(s.parent)||kids.set(s.parent,[]).get(s.parent)).push(s)}
+}
+function visible(s,seen=new Set()){
+  if(!$("month").checked)return true;
+  if(seen.has(s.id))return false;seen.add(s.id);
+  return total(s)>0||(kids.get(s.id)||[]).some(c=>visible(c,seen));
+}
+function subtree(s,seen=new Set()){
+  if(seen.has(s.id))return zero();seen.add(s.id);
+  const t=add(zero(),s);t.count=1;
+  for(const c of kids.get(s.id)||[]){if(!$("arch").checked&&c.archived)continue;const x=subtree(c,seen);add(t,x);t.count+=x.count}
+  return t;
+}
+const total=t=>t.input+t.output;
+function renderList(){
+  const q=$("q").value.toLowerCase(),f=$("folder").value;
+  const items=D.sessions.filter(s=>(f===""||s.folder===f)&&($("arch").checked||!s.archived)&&visible(s)
+    &&(!$("onlyParents").checked||(kids.get(s.id)||[]).length)&&(!q||s.title.toLowerCase().includes(q)||s.id.includes(q)))
+    .map(s=>({s,t:subtree(s)})).sort((a,b)=>total(b.t)-total(a.t));
+  $("list").innerHTML=items.map(({s,t})=>`<div class="item ${s.id===sel?"sel":""}" data-id="${s.id}"><b>${esc(s.title)}</b>
+   <span class="mut">${t.count} session${t.count>1?"s":""} · ${short(total(t))} tokens · ${costText(t)} · ${esc((s.updated||"").slice(0,10))}</span></div>`).join("")||'<div class="item mut">No sessions</div>';
+  for(const el of $("list").querySelectorAll(".item[data-id]"))el.onclick=()=>{sel=el.dataset.id;fetch(base+"api/select?id="+sel);renderList();renderMain()};
+}
+function rowsOf(s,depth,max,out,seen){
+  if(seen.has(s.id))return;seen.add(s.id);
+  const t=subtree(s);out.push({s,t,depth,own:s});
+  for(const c of (kids.get(s.id)||[]).sort((a,b)=>(a.created||"").localeCompare(b.created||""))){
+    if(!$("arch").checked&&c.archived||!visible(c))continue;rowsOf(c,depth+1,max,out,seen)}
+}
+function gather(){
+  const f=$("folder").value,ym=new Date().toISOString().slice(0,7),on=$("month").checked;
+  const ss=D.sessions.filter(s=>(f===""||s.folder===f)&&($("arch").checked||!s.archived)&&(total(s)>0||s.costCalls||s.missingCost));
+  const t=zero(),models=new Map(),proj=new Map();
+  for(const s of ss){
+    add(t,s);
+    const p=proj.get(s.project||"(none)")||{name:s.project||"(none)",n:0,...zero()};p.n++;add(p,s);proj.set(p.name,p);
+    for(const m of s.models.filter(m=>!on||m.ym===ym)){const x=models.get(m.model)||{model:m.model,calls:0,input:0,output:0,cache_read:0,reasoning:0,cost:0,costCalls:0,missingCost:0};
+      for(const k of ["calls","input","output","cache_read","reasoning"])x[k]+=m[k]||0;add(x,costFromModels([m]));models.set(m.model,x)}
+  }
+  return{f,on,ss,t,models,proj};
+}
+function buildPrompt(){
+  const {f,on,ss,t,models,proj}=gather();
+  const line=(n,o)=>`${n}: total=${fmt(total(o))}, input=${fmt(o.input)}, cached=${fmt(o.cached)}, output=${fmt(o.output)}, reasoning=${fmt(o.reasoning)}`;
+  const roots=ss.filter(s=>!s.parent||!byId.has(s.parent)).map(s=>({s,t:subtree(s)})).sort((a,b)=>total(b.t)-total(a.t)).slice(0,15);
+  const top=ss.slice().sort((a,b)=>total(b)-total(a)).slice(0,15);
+  const cacheRatio=t.input?Math.round(t.cached/t.input*100):0;
+  return `You are a GitHub Copilot usage analyst. Below is my Copilot token usage summary from the local usage logs (period: ${on?"current calendar month":"all time"}, folder: ${f||"all"}${$("arch").checked?", incl. archived sessions":""}). Analyse it and tell me concretely where I can save tokens (and premium requests/cost) without hurting results.
+
+## Global totals
+${line("All sessions ("+ss.length+")",t)}
+Cached share of input: ${cacheRatio}%
+
+## By project
+${[...proj.values()].sort((a,b)=>total(b)-total(a)).map(p=>line(`${p.name} (${p.n} sessions)`,p)).join("\n")}
+
+## By model (calls, input, cache read, output, reasoning)
+${[...models.values()].sort((a,b)=>b.input-a.input).map(m=>`${m.model}: calls=${fmt(m.calls)}, avg input/call=${fmt(Math.round(m.input/Math.max(1,m.calls)))}, input=${fmt(m.input)}, cache_read=${fmt(m.cache_read)}, output=${fmt(m.output)}, reasoning=${fmt(m.reasoning)}`).join("\n")}
+
+## Top 15 session trees (incl. sub-sessions)
+${roots.map(r=>line(`${r.s.title} [${r.t.count} sessions, ${r.s.project||"-"}, ${(r.s.created||"").slice(0,10)}]`,r.t)).join("\n")}
+
+## Top 15 single sessions (own tokens)
+${top.map(s=>line(`${s.title} [${s.project||"-"}, ${(s.created||"").slice(0,10)}]`,s)).join("\n")}
+
+## What to check and report
+1. Which sessions/projects/models dominate usage; is the most expensive model used where a cheaper one would do (e.g. exploration, summaries, simple edits, test/build runs)?
+2. Very high average input per call: long-running sessions with huge context. Recommend where to start a fresh session, compact/summarize, or split work.
+3. Cache efficiency: cached share of input and sessions with low cache reuse (context changing too much).
+4. Parent/sub-session patterns: orchestrator sessions with many children, repeated planning + exec pairs, duplicated exploration, sub-agents re-reading the same files.
+5. Heavy reasoning/output use that could be reduced (lower reasoning effort, shorter prompts, less verbose answers).
+6. Large instruction/skill/tool context loaded on every call (custom instructions, MCP servers, skills) that could be trimmed or loaded on demand.
+7. Prioritised list of concrete actions with an estimated saving (% or tokens) for each, easiest and biggest first, plus habits to adopt going forward.
+If you need more detail, inspect ~\\.copilot\\session-store.db (table assistant_usage_events: session_id, model, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, created_at, agent_id) and ~\\.copilot\\data.db (sessions, chat_parent_links, workspace_parent_links) read-only.`;
+}
+function summary(){
+  const {f,on,ss,t,models,proj}=gather();
+  const top=ss.slice().sort((a,b)=>total(b)-total(a)).slice(0,15);
+  const q=quotaSummary(),fc=forecast(q);
+  $("main").innerHTML=`<h2>All sessions — summary</h2><div class="mut">${on?"Current month":"All time"} · ${f?esc(f):"all folders"}${$("arch").checked?" · incl. archived":""}</div>
+  <h3>Account allowance · current month</h3>
+  ${q?`<div class="cards">
+   <div class="card"><div class="mut">Used</div><div class="v">${dollars(q.used)}</div><div class="mut">${fmt(q.creditsUsed)} AI credits</div></div>
+   <div class="card"><div class="mut">Remaining</div><div class="v">${dollars(q.remaining)}</div></div>
+   <div class="card"><div class="mut">Allowance</div><div class="v">${dollars(q.limit)}</div><div class="mut">${fmt(q.creditsLimit)} AI credits</div></div>
+   <div class="card"><div class="mut">Used</div><div class="v">${(q.used/q.limit*100).toFixed(1)}%</div></div>
+  </div><div class="mut">Copilot account quota · 1 AI credit = $0.01 · observed ${esc(q.observed||"time unavailable")} · not affected by session filters.</div>
+  <h3>Month-end forecast</h3>${fc?`<div class="cards">
+   <div class="card"><div class="mut">Projected total</div><div class="v">${dollars(fc.projected)}</div><div class="mut">${fmt(Math.round(fc.projected*100))} AI credits</div></div>
+   <div class="card"><div class="mut">Projected additional usage</div><div class="v">${dollars(fc.additional)}</div><div class="mut">${fmt(Math.round(fc.additional*100))} AI credits</div></div>
+   <div class="card"><div class="mut">${fc.difference>0?"Projected over allowance":"Projected under allowance"}</div><div class="v">${dollars(Math.abs(fc.difference))}</div><div class="mut">${fmt(Math.round(Math.abs(fc.difference)*100))} AI credits</div></div>
+  </div><div class="mut">Based on average usage since the start of the UTC month continuing at the same rate. ${fc.daysLeft.toFixed(1)} days remain; resets ${esc(new Date(q.reset).toISOString())}. This is an estimate, not a bill.</div>`:'<div class="mut">Forecast unavailable: a valid monthly reset time is not available.</div>'}`
+  :`<div class="mut">Account balance unavailable${quotaError?": "+esc(quotaError):": no authoritative AI-credit allowance returned"}. Refresh to try again.</div>`}
+  <div style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap"><button id="aiAsk" style="width:auto">💡 Send insights request to current chat</button><button id="aiCopy" style="width:auto">Copy prompt</button><span id="aiMsg" class="mut"></span></div>
+  <div class="mut">Session costs below are recorded local model charges; they may exclude other devices or Copilot products and may differ from the account balance. ≥ means usage or charges are missing from the local log; unavailable means no recorded charges. USD values are credit equivalents, not necessarily extra charges.</div>
+  <div class="cards">
+   <div class="card"><div class="mut">Sessions</div><div class="v">${ss.length}</div></div>
+   <div class="card"><div class="mut">Local session costs</div><div class="v">${costText(t)}</div></div>
+   <div class="card"><div class="mut">Input + output</div><div class="v">${short(total(t))}</div><div class="mut">${fmt(total(t))}</div></div>
+   <div class="card"><div class="mut">Input</div><div class="v">${short(t.input)}</div><div class="mut">${short(t.cached)} cached</div></div>
+   <div class="card"><div class="mut">Output</div><div class="v">${short(t.output)}</div></div>
+   <div class="card"><div class="mut">Reasoning</div><div class="v">${short(t.reasoning)}</div></div>
+  </div>
+  <h3>By project</h3><table><tr><th>Project</th><th>Sessions</th><th>Total</th><th>Input</th><th>Output</th><th>Cost</th></tr>
+  ${[...proj.values()].sort((a,b)=>total(b)-total(a)).map(p=>`<tr><td>${esc(p.name)}</td><td>${p.n}</td><td>${fmt(total(p))}</td><td>${fmt(p.input)}</td><td>${fmt(p.output)}</td><td data-sort="${p.costCalls?p.cost:""}">${costText(p)}</td></tr>`).join("")}</table>
+  <h3>By model</h3><table><tr><th>Model</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Output</th><th>Reasoning</th><th>Cost</th></tr>
+  ${[...models.values()].sort((a,b)=>b.input-a.input).map(m=>`<tr><td>${esc(m.model)}</td><td>${fmt(m.calls)}</td><td>${fmt(m.input)}</td><td>${fmt(m.cache_read)}</td><td>${fmt(m.output)}</td><td>${fmt(m.reasoning)}</td><td data-sort="${m.costCalls?m.cost:""}">${costText(m)}</td></tr>`).join("")}</table>
+  <h3>Top sessions (own tokens)</h3><table><tr><th>Session</th><th>Total</th><th>Cost</th></tr>
+  ${top.map(s=>`<tr><td>${esc(s.title)}</td><td>${fmt(total(s))}</td><td data-sort="${s.costCalls?s.cost:""}">${costText(s)}</td></tr>`).join("")}</table>`;
+  $("aiCopy").onclick=async()=>{const p=buildPrompt();try{await navigator.clipboard.writeText(p);$("aiMsg").textContent="Copied — paste into a new chat."}catch{
+    const ta=document.createElement("textarea");ta.value=p;ta.style.cssText="width:100%;height:200px";$("aiMsg").after(ta);ta.select();try{document.execCommand("copy");$("aiMsg").textContent="Copied — paste into a new chat."}catch{$("aiMsg").textContent="Select the text below and copy."}}};
+  $("aiAsk").onclick=async()=>{$("aiMsg").textContent="Sending...";
+    try{const r=await fetch(base+"api/ask",{method:"POST",headers:{"Content-Type":"text/plain"},body:buildPrompt()});const j=await r.json();
+      $("aiMsg").textContent=j.ok?"Sent to the chat session that hosts this canvas.":"Failed: "+(j.error||r.status)}catch(e){$("aiMsg").textContent="Failed: "+e.message}};
+}
+const sortState={};
+function enableSort(){
+  document.querySelectorAll("#main table").forEach(tb=>{
+    const hs=[...tb.rows[0].cells],key=hs[0].textContent;
+    const apply=(i,dir)=>{
+      const rows=[...tb.rows].slice(1).filter(r=>r.cells.length===hs.length);
+      const val=r=>{const c=r.cells[i];if(c.dataset.sort!==undefined)return c.dataset.sort===""?-Infinity:Number(c.dataset.sort);const t=c.firstChild?.textContent??c.textContent;const n=c.textContent.replace(/,|\s/g,"");return i>0&&/^\d/.test(n)?parseFloat(n):t.toLowerCase()};
+      rows.sort((a,b)=>{const x=val(a),y=val(b);return(x>y?1:x<y?-1:0)*dir});
+      rows.forEach(r=>tb.tBodies[0].appendChild(r));
+      hs.forEach((h,j)=>h.dataset.dir=j===i?(dir>0?"▲":"▼"):"");
+    };
+    hs.forEach((h,i)=>{h.style.cursor="pointer";h.title="Click to sort";
+      h.onclick=()=>{const s=sortState[key];const dir=s&&s.i===i?-s.dir:(i?-1:1);sortState[key]={i,dir};apply(i,dir)}});
+    const s=sortState[key];if(s&&s.i<hs.length)apply(s.i,s.dir);
+  });
+}
+function renderMain(){
+  renderMain0();enableSort();
+}
+function renderMain0(){
+  const root=byId.get(sel);
+  if(!root){summary();return}
+  const t=subtree(root),out=[];rowsOf(root,0,0,out,new Set());
+  const max=Math.max(1,...out.map(r=>total(r.own)));
+  const models=new Map();
+  (function walk(s,seen){if(seen.has(s.id))return;seen.add(s.id);
+    for(const m of s.models.filter(m=>!$("month").checked||m.ym===new Date().toISOString().slice(0,7))){const x=models.get(m.model)||{model:m.model,calls:0,input:0,output:0,cache_read:0,reasoning:0,cost:0,costCalls:0,missingCost:0};
+      for(const k of ["calls","input","output","cache_read","reasoning"])x[k]+=m[k]||0;add(x,costFromModels([m]));models.set(m.model,x)}
+    for(const c of kids.get(s.id)||[]){if($("arch").checked||!c.archived)walk(c,seen)}})(root,new Set());
+  $("main").innerHTML=`<h2>${esc(root.title)}</h2><div class="mut">${esc(root.folder||"")} ${root.branch?"· "+esc(root.branch):""} · ${esc(root.id)}</div>
+  <div class="mut">USD amounts are local recorded credit equivalents, not necessarily extra charges. ≥ means usage or charges are missing from the local log; unavailable means no recorded charges.</div>
+  <div class="cards">
+   <div class="card"><div class="mut">Sessions</div><div class="v">${t.count}</div></div>
+   <div class="card"><div class="mut">Cost with sub-sessions</div><div class="v">${costText(t)}</div></div>
+   <div class="card"><div class="mut">Input + output</div><div class="v">${short(total(t))}</div><div class="mut">${fmt(total(t))}</div></div>
+   <div class="card"><div class="mut">Input</div><div class="v">${short(t.input)}</div><div class="mut">${short(t.cached)} cached</div></div>
+   <div class="card"><div class="mut">Output</div><div class="v">${short(t.output)}</div></div>
+   <div class="card"><div class="mut">Reasoning</div><div class="v">${short(t.reasoning)}</div></div>
+  </div>
+  <h3>Sessions</h3>
+  <table><tr><th>Session</th><th>Own total</th><th>Input</th><th>Cached</th><th>Output</th><th>With sub-sessions</th><th>Own cost</th><th>Cost with sub-sessions</th></tr>
+  ${out.map(r=>`<tr class="${r.depth?"":"root"}"><td style="padding-left:${8+r.depth*18}px">${r.depth?"↳ ":""}${esc(r.s.title)} ${r.s.archived?'<span class="tag">archived</span>':""}
+   <div class="mut">${esc((r.s.created||"").slice(0,16).replace("T"," "))}</div></td>
+   <td>${fmt(total(r.own))}<span class="bar" style="width:${Math.round(total(r.own)/max*80)}px"></span></td>
+   <td>${fmt(r.own.input)}</td><td>${fmt(r.own.cached)}</td><td>${fmt(r.own.output)}</td><td>${fmt(total(r.t))}</td><td data-sort="${r.own.costCalls?r.own.cost:""}">${costText(r.own)}</td><td data-sort="${r.t.costCalls?r.t.cost:""}">${costText(r.t)}</td></tr>`).join("")}</table>
+  <h3>By model <span class="mut">(sessions known to the local usage log)</span></h3>
+  <table><tr><th>Model</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Output</th><th>Reasoning</th><th>Cost</th></tr>
+  ${[...models.values()].sort((a,b)=>b.input-a.input).map(m=>`<tr><td>${esc(m.model)}</td><td>${fmt(m.calls)}</td><td>${fmt(m.input)}</td><td>${fmt(m.cache_read)}</td><td>${fmt(m.output)}</td><td>${fmt(m.reasoning)}</td><td data-sort="${m.costCalls?m.cost:""}">${costText(m)}</td></tr>`).join("")||'<tr><td colspan="7" class="mut">No per-model data</td></tr>'}</table>`;
+}
+async function load(){
+  let r;
+  try{
+    const [dataResponse,quotaResult]=await Promise.all([
+      fetch(base+"api/data"),
+      fetch(base+"api/quota").then(async response=>({ok:response.ok,body:await response.json(),status:response.status})).catch(error=>({ok:false,body:{error:error.message}}))
+    ]);
+    r=await dataResponse.json();
+    quota=quotaResult.ok?quotaResult.body:null;quotaError=quotaResult.ok?null:(quotaResult.body.error||`HTTP ${quotaResult.status}`);
+  }catch(e){$("main").innerHTML='<div class="mut">Error loading usage: '+esc(e.message)+'</div>';return}
+  if(r.error){$("main").innerHTML='<div class="mut">Error: '+esc(r.error)+'</div>';return}
+  D=r;index();sel=sel||r.selected;
+  const folders=[...new Set(D.sessions.map(s=>s.folder).filter(Boolean))].sort(),cur=$("folder").value;
+  $("folder").innerHTML='<option value="">All folders</option>'+folders.map(f=>`<option value="${esc(f)}">${esc(f)}</option>`).join("");
+  $("folder").value=folders.includes(cur)?cur:"";
+  renderList();renderMain();
+}
+for(const id of["q","folder","onlyParents","arch"])$(id).oninput=()=>{renderList();renderMain()};
+$("month").oninput=()=>{index();renderList();renderMain()};
+$("reload").onclick=load;$("summ").onclick=()=>{sel=null;fetch(base+"api/select");renderList();renderMain()};load();
+</script></body></html>
