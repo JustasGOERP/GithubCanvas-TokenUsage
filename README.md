@@ -20,7 +20,11 @@ Choose a user installation to make it available across projects. Alternatively, 
 
 Ask the assistant to open **Session Token Usage**. Select a session to see its usage and descendants, or choose **Global summary** for totals, allowance, and the forecast. Filter by folder, month, or archived status and use Refresh to update the data.
 
-The extension reads local Copilot databases read-only and serves the panel on localhost. The optional **Send insights request** button sends a usage summary, including session and project names, to the current chat; **Copy prompt** copies it instead. Account quota is retrieved through Copilot. Local cost totals can be incomplete, and the forecast is an estimate, not a bill.
+The extension reads local Copilot databases read-only and serves the panel on localhost.
+
+**MCP servers & plugins** (button in the left panel) scans local session logs (`~/.copilot/session-state/*/events.jsonl`) and lists each MCP server and plugin with sessions connected, sessions used, call counts, tools used vs. available, and estimated tokens loaded per call. Items that were loaded but never used are flagged as candidates to turn off in Customize. Total tool-definition tokens are logged by Copilot; the per-server and skill-list figures are estimates.
+
+The optional **Send insights request** button sends a usage summary, including session and project names, to the current chat; **Copy prompt** copies it instead. Account quota is retrieved through Copilot. Local cost totals can be incomplete, and the forecast is an estimate, not a bill.
 
 ## Test
 

@@ -13,15 +13,20 @@ function fileURLToPathSafe(u) {
     return decodeURIComponent(u.pathname).replace(/^\/([a-z]:)/i, "$1");
 }
 
-export function loadUsage() {
+const PY_CONNECTORS = fileURLToPathSafe(new URL("./connectors.py", import.meta.url));
+
+function runPython(script) {
     return new Promise((resolve, reject) => {
-        const run = (cmd, cb) => execFile(cmd, [PY], { maxBuffer: 64 * 1024 * 1024, windowsHide: true }, cb);
+        const run = (cmd, cb) => execFile(cmd, [script], { maxBuffer: 64 * 1024 * 1024, windowsHide: true }, cb);
         run("python", (err, out) => {
             if (err) return run("py", (err2, out2) => (err2 ? reject(err) : resolve(JSON.parse(out2))));
             resolve(JSON.parse(out));
         });
     });
 }
+
+export const loadUsage = () => runPython(PY);
+export const loadConnectors = () => runPython(PY_CONNECTORS);
 
 export async function startPanelServer(state, onAsk, getQuota) {
     const prefix = `/${randomBytes(24).toString("base64url")}/`;
@@ -50,6 +55,10 @@ export async function startPanelServer(state, onAsk, getQuota) {
         const json = (code, body) => { res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", ...HEADERS }); res.end(JSON.stringify(body)); };
         if (route === "api/data") {
             try { return json(200, { ...(await loadUsage()), selected: state.selected }); }
+            catch (e) { return json(500, { error: String(e.message || e) }); }
+        }
+        if (route === "api/connectors") {
+            try { return json(200, await loadConnectors()); }
             catch (e) { return json(500, { error: String(e.message || e) }); }
         }
         if (route === "api/quota") {

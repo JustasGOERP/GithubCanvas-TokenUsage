@@ -33,13 +33,14 @@ th[data-dir]:not([data-dir=""])::after{content:" " attr(data-dir)}
   <label><input type="checkbox" id="onlyParents"> Only sessions with sub-sessions</label>
   <label><input type="checkbox" id="arch"> Include archived</label>
   <button id="summ">Σ Global summary</button>
+  <button id="conn">🔌 MCP servers &amp; plugins</button>
   <button id="reload">Refresh</button>
  </div>
  <div id="list"></div>
 </div>
 <div id="main"><div class="mut">Loading...</div></div>
 <script>
-const base=location.pathname;let D=null,sel=null,quota=null,quotaError=null;
+const base=location.pathname;let D=null,sel=null,quota=null,quotaError=null,view=null,C=null,connError=null;
 const $=id=>document.getElementById(id);
 const fmt=n=>(n||0).toLocaleString("en-US");
 const short=n=>n>=1e6?(n/1e6).toFixed(2)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":String(n||0);
@@ -96,7 +97,7 @@ function renderList(){
     .map(s=>({s,t:subtree(s)})).sort((a,b)=>total(b.t)-total(a.t));
   $("list").innerHTML=items.map(({s,t})=>`<div class="item ${s.id===sel?"sel":""}" data-id="${s.id}"><b>${esc(s.title)}</b>
    <span class="mut">${t.count} session${t.count>1?"s":""} · ${short(total(t))} tokens · ${costText(t)} · ${esc((s.updated||"").slice(0,10))}</span></div>`).join("")||'<div class="item mut">No sessions</div>';
-  for(const el of $("list").querySelectorAll(".item[data-id]"))el.onclick=()=>{sel=el.dataset.id;fetch(base+"api/select?id="+sel);renderList();renderMain()};
+  for(const el of $("list").querySelectorAll(".item[data-id]"))el.onclick=()=>{sel=el.dataset.id;view=null;fetch(base+"api/select?id="+sel);renderList();renderMain()};
 }
 function rowsOf(s,depth,max,out,seen){
   if(seen.has(s.id))return;seen.add(s.id);
@@ -210,6 +211,7 @@ function renderMain(){
   renderMain0();enableSort();
 }
 function renderMain0(){
+  if(view==="conn"){connView();return}
   const root=byId.get(sel);
   if(!root){summary();return}
   const t=subtree(root),out=[];rowsOf(root,0,0,out,new Set());
@@ -239,6 +241,51 @@ function renderMain0(){
   <table><tr><th>Model</th><th>Calls</th><th>Input</th><th>Cache read</th><th>Output</th><th>Reasoning</th><th>Cost</th></tr>
   ${[...models.values()].sort((a,b)=>b.input-a.input).map(m=>`<tr><td>${esc(m.model)}</td><td>${fmt(m.calls)}</td><td>${fmt(m.input)}</td><td>${fmt(m.cache_read)}</td><td>${fmt(m.output)}</td><td>${fmt(m.reasoning)}</td><td data-sort="${m.costCalls?m.cost:""}">${costText(m)}</td></tr>`).join("")||'<tr><td colspan="7" class="mut">No per-model data</td></tr>'}</table>`;
 }
+async function connView(){
+  if(!C&&!connError){
+    $("main").innerHTML='<div class="mut">Scanning session logs for MCP servers, plugins and skills (a few seconds)...</div>';
+    try{const r=await(await fetch(base+"api/connectors")).json();if(r.error)connError=r.error;else C=r}catch(e){connError=e.message}
+    if(view!=="conn")return;
+  }
+  if(connError){$("main").innerHTML='<div class="mut">Error: '+esc(connError)+'</div>';connError=null;return}
+  const f=$("folder").value,ym=new Date().toISOString().slice(0,7),on=$("month").checked;
+  const ss=D.sessions.filter(s=>(f===""||s.folder===f)&&($("arch").checked||!s.archived)&&(!on||(s.updated||"").slice(0,7)===ym)&&C.sessions[s.id]);
+  const srv=new Map(),plug=new Map();let calls=0,toolTokens=0,toolCost=0;
+  const sv=n=>srv.get(n)||srv.set(n,{name:n,connected:0,used:0,calls:0,full:0,deferred:0,perCall:0,tokens:0,cost:0,tools:new Set()}).get(n);
+  for(const s of ss){
+    const c=C.sessions[s.id],usd=c.priceSum/1e11;calls+=c.calls;toolTokens+=c.toolTokens;if(c.calls)toolCost+=c.toolTokens/c.calls*usd;
+    for(const [n,e] of Object.entries(c.servers)){const x=sv(n);x.connected++;x.full=Math.max(x.full,e.full);x.deferred=Math.max(x.deferred,e.deferred);x.perCall=Math.max(x.perCall,e.perCall);x.tokens+=e.perCall*c.calls;x.cost+=e.perCall*usd}
+    for(const [n,tools] of Object.entries(c.mcp)){const x=sv(n),k=Object.values(tools).reduce((a,b)=>a+b,0);x.used++;x.calls+=k;Object.keys(tools).forEach(t=>x.tools.add(t))}
+  }
+  const pl=n=>plug.get(n)||plug.set(n,{name:n,skillUses:0,agentUses:0,loaded:0,perCall:0,tokens:0,cost:0}).get(n);
+  for(const s of ss){const c=C.sessions[s.id],usd=c.priceSum/1e11;
+    for(const [k,t] of Object.entries(c.plugins||{})){const x=pl(k);x.loaded++;x.perCall=Math.max(x.perCall,t);x.tokens+=t*c.calls;x.cost+=t*usd}
+    for(const [k,v] of Object.entries(c.skills)){const p=C.skills[k]||(k.includes(":")?k.split(":")[0]:null);if(p)pl(p).skillUses+=v}
+    for(const [k,v] of Object.entries(c.agents))pl(k).agentUses+=v}
+  const verdict=(connected,used)=>!connected?'<span class="tag">not loaded</span>':used?'<span class="tag">in use</span>':'<b style="color:#d29922">Never used — consider disabling</b>';
+  const usd=n=>n>0&&n<0.01?"&lt; $0.01":dollars(n);
+  const servers=[...srv.values()].sort((a,b)=>b.cost-a.cost);
+  const spl=C.serverPlugin;
+  const plugins=C.plugins.map(p=>{const u=pl(p.name),mcpCalls=p.servers.reduce((n,s)=>n+(srv.get(s)?.calls||0),0);
+    return{...p,...u,mcpCalls,used:u.skillUses+u.agentUses+mcpCalls}}).sort((a,b)=>b.cost-a.cost);
+  const wasted=servers.filter(x=>x.connected&&!x.calls).reduce((n,x)=>n+x.cost,0)+plugins.filter(p=>p.loaded&&!p.used).reduce((n,p)=>n+p.cost,0);
+  $("main").innerHTML=`<h2>MCP servers &amp; plugins — what is loaded vs. used</h2>
+  <div class="mut">${on?"Current month":"All time"} · ${f?esc(f):"all folders"}${$("arch").checked?" · incl. archived":""} · ${ss.length} sessions with logs · same filters as the left panel</div>
+  <div class="cards">
+   <div class="card"><div class="mut">Model calls</div><div class="v">${fmt(calls)}</div></div>
+   <div class="card"><div class="mut">Tool definitions sent</div><div class="v">${short(toolTokens)}</div><div class="mut">${calls?short(Math.round(toolTokens/calls)):0} tokens per call · ≈ ${usd(toolCost)}</div></div>
+   <div class="card"><div class="mut">Spent on never-used items</div><div class="v">≈ ${usd(wasted)}</div><div class="mut">possible saving</div></div>
+   <div class="card"><div class="mut">MCP servers seen</div><div class="v">${servers.length}</div><div class="mut">${servers.filter(x=>x.connected&&!x.calls).length} never used</div></div>
+   <div class="card"><div class="mut">Plugins enabled</div><div class="v">${plugins.filter(p=>p.enabled).length}</div><div class="mut">${plugins.filter(p=>p.loaded&&!p.used).length} loaded but never used</div></div>
+  </div>
+  <div class="mut">Tool-definition tokens per call are logged by Copilot. The split per server is an <b>estimate</b>: tools sent in full share that total evenly; deferred tools cost ~12 tokens (name only). Skill tokens are measured from the skills list actually sent in each session's prompt. Cost = tokens × each call's real input price (mostly cheap cached reads), as recorded in the local log — USD values are credit equivalents, like the session view.</div>
+  <h3>MCP servers</h3><table><tr><th>Server</th><th>Plugin</th><th>Sessions connected</th><th>Sessions used</th><th>Calls</th><th>Tools used / available</th><th>Est. tokens per call</th><th>Est. tokens total</th><th>Est. cost</th><th>Verdict</th></tr>
+  ${servers.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(spl[x.name]||"built-in / other")}</td><td>${x.connected}</td><td>${x.used}</td><td>${fmt(x.calls)}</td><td>${x.tools.size} / ${x.full+x.deferred} <span class="mut">(${x.full} full, ${x.deferred} deferred)</span></td><td>${fmt(x.perCall)}</td><td>${short(x.tokens)}</td><td data-sort="${x.cost}">${usd(x.cost)}</td><td style="text-align:left">${verdict(x.connected,x.calls)}</td></tr>`).join("")||'<tr><td colspan="10" class="mut">No MCP data</td></tr>'}</table>
+  <h3>Plugins</h3><table><tr><th>Plugin</th><th>Enabled</th><th>Skills</th><th>Sessions loaded</th><th>Tokens per call</th><th>Skill invocations</th><th>Agent invocations</th><th>MCP calls</th><th>Tokens total</th><th>Est. cost</th><th>Verdict</th></tr>
+  ${plugins.map(p=>`<tr><td>${esc(p.name)}${p.servers.length?` <div class="mut">MCP: ${esc(p.servers.join(", "))}</div>`:""}</td><td>${p.enabled?"yes":"no"}</td><td>${p.skills}</td><td>${p.loaded}</td><td>${fmt(p.perCall)}</td><td>${p.skillUses}</td><td>${p.agentUses}</td><td>${fmt(p.mcpCalls)}</td><td>${short(p.tokens)}</td><td data-sort="${p.cost}">${usd(p.cost)}</td><td style="text-align:left">${verdict(p.loaded,p.used)}</td></tr>`).join("")}</table>
+  <div class="mut">Plugin cost covers its skills list only; its MCP servers are in the table above. "Used" counts skill and sub-agent invocations and calls to the plugin's MCP servers. Turn items off in Customize.</div>`;
+  enableSort();
+}
 async function load(){
   let r;
   try{
@@ -258,5 +305,6 @@ async function load(){
 }
 for(const id of["q","folder","onlyParents","arch"])$(id).oninput=()=>{renderList();renderMain()};
 $("month").oninput=()=>{index();renderList();renderMain()};
-$("reload").onclick=load;$("summ").onclick=()=>{sel=null;fetch(base+"api/select");renderList();renderMain()};load();
+$("reload").onclick=()=>{C=null;load()};$("summ").onclick=()=>{sel=null;view=null;fetch(base+"api/select");renderList();renderMain()};
+$("conn").onclick=()=>{view="conn";renderMain()};load();
 </script></body></html>
